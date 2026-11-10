@@ -1,0 +1,7 @@
+herdr-files-preview
+Copyright 2026 focus000
+
+mods/files-preview is derived from the "files" mod shipped with herdr-app
+(https://github.com/herdrdev/herdr-app), licensed under the Apache License 2.0.
+The right-click menu follows the pattern of files-open-with in
+VladTemp27/herdr-orca (Apache License 2.0).
