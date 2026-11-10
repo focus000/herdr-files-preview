@@ -3,9 +3,9 @@
 // props.role === "menu" is the right-click popup.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, panes, focused, exec, watchFolder, theme, window, props } from "herdr";
-import Menu, { openFileMenu } from "./menu.js";
-import { loadPage, loadPreview, renderPreview, textEditor } from "./preview.js";
+import { spaces, panes, focused, exec, watchFolder, theme, window, props, shared, notify } from "herdr";
+import Menu, { MENU, REQUEST, openFileMenu } from "./menu.js";
+import { formatBytes, loadPage, loadPreview, renderPreview, textEditor } from "./preview.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -60,6 +60,9 @@ export default class Files extends View {
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.preview = { state: "idle" };
     this.dismissed = false;
+    this.uid = `${Date.now()}-${Math.random()}`;
+    this.handled = shared(REQUEST)?.seq;
+    this.jobs = new Map();
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
   }
@@ -218,7 +221,7 @@ export default class Files extends View {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
-        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); cx.spawn(async () => { await openFileMenu(this.entryFor(path, entry.dir, entry.name)); }); })
+        .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); cx.spawn(async () => { await openFileMenu(this.entryFor(path, entry.dir, entry.name), this.uid); }); })
         .child(entry.dir ? svg(`mods/files-preview/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/files-preview/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
         .child(div().flex_1().min_w(0).truncate().child(entry.name))
@@ -228,8 +231,36 @@ export default class Files extends View {
     return out;
   }
 
+  take(cx) {
+    const req = shared(REQUEST);
+    if (!req || req.to !== this.uid || req.seq === this.handled) return;
+    this.handled = req.seq;
+    const item = MENU.find(i => i.id === req.id);
+    if (!item) return;
+    const job = { verb: item.verb, name: req.entry.name, got: 0, total: null };
+    if (item.verb) this.jobs.set(req.seq, job);
+    cx.spawn(async cx => {
+      try {
+        await item.run(req.entry, (got, total) => { job.got = got; job.total = total; cx.notify(); });
+      } catch (error) {
+        notify({ title: item.label, body: String(error?.message || error), level: "error" });
+      } finally {
+        this.jobs.delete(req.seq);
+        cx.notify();
+      }
+    });
+  }
+
+  jobBar(t) {
+    return v_flex().flex_none().border_t(1).border_color(t.border).px(12).py(6).gap(4).text_size(12).text_color(t.muted)
+      .children([...this.jobs.entries()].map(([seq, job]) => h_flex().id(`job-${seq}`).gap(8).items_center()
+        .child(div().flex_1().min_w(0).truncate().child(`${job.verb} ${job.name}`))
+        .child(div().flex_none().text_color(t.dim).child(job.total ? `${formatBytes(job.got)} / ${formatBytes(job.total)}` : "…"))));
+  }
+
   render(cx) {
     if (paneProps().role === "menu") return this.menu.render(cx);
+    this.take(cx);
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme();
     const title = this.file ? this.file.split(/[\\/]/).pop() : this.root?.split(/[\\/]/).pop() ?? "";
@@ -238,7 +269,7 @@ export default class Files extends View {
         .on_mouse_down("right", (_e, cx) => {
           if (!this.file) return;
           cx.stop_propagation();
-          cx.spawn(async () => { await openFileMenu(this.entryFor(this.file, false)); });
+          cx.spawn(async () => { await openFileMenu(this.entryFor(this.file, false), this.uid); });
         })
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.dismissed = true; this.show(null); cx.notify(); }).child("←")))
         .child(div().font_semibold().child("Files"))
@@ -257,8 +288,9 @@ export default class Files extends View {
         })
         .on_mouse_down("right", (_e, cx) => {
           cx.stop_propagation();
-          cx.spawn(async () => { await openFileMenu(this.entryFor(this.file, false)); });
+          cx.spawn(async () => { await openFileMenu(this.entryFor(this.file, false), this.uid); });
         })
-        .child(renderPreview(this.preview, this.code, this.box, (delta, cx) => this.turn(delta, cx)))));
+        .child(renderPreview(this.preview, this.code, this.box, (delta, cx) => this.turn(delta, cx)))))
+      .when(this.jobs.size > 0, el => el.child(this.jobBar(t)));
   }
 }

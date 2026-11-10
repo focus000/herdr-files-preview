@@ -5,7 +5,7 @@ A [Herdr](https://herdr.dev) mod: Herdr's Files panel with Quick Look-style prev
 ![Files Preview](preview.png)
 
 - **Previews**: images (PNG, JPEG, GIF, WebP, SVG, HEIC, TIFF; huge photos scaled), PDFs page by page, Office/iWork documents, video and audio frames through macOS Quick Look, rendered markdown, and code.
-- **Remote files**: a space on another machine previews the same way. Files come through herdr-core in 8 MB chunks, so no ssh keys or `scp` are needed. Cached by path, mtime and size.
+- **Remote files**: a space on another machine previews the same way. Files come through herdr-core in 2 MB chunks, with progress in the panel, so no ssh keys or `scp` are needed. Cached by path, mtime and size.
 - **Right-click**: Quick Look, Open, Open in VS Code, Download to Downloads, Reveal in Finder, Copy Path.
 
 ## Install

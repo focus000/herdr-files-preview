@@ -1,15 +1,18 @@
 // Declarative right-click menu. The popup is another copy of this mod
-// (props.role === "menu") so it can run an item after the panel is gone.
+// (props.role === "menu"). Closing it cancels its tasks after their first
+// await, so it only posts a request; the panel that opened it runs the item.
 import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { closeOverlay, exec, notify, openOverlay, props, theme, window } from "herdr";
+import { closeOverlay, exec, notify, openOverlay, props, setShared, theme, window } from "herdr";
 import { baseName, downloadToDownloads, materialize } from "./fetch.js";
 
+export const REQUEST = "files-preview.request";
+
 export const MENU = [
-  { id: "quicklook", label: "Quick Look", when: (entry, ctx) => ctx.macos && !entry.dir, run: quickLook },
-  { id: "open", label: "Open", when: (entry, ctx) => ctx.macos && !entry.dir, run: openDefault },
+  { id: "quicklook", label: "Quick Look", verb: "Fetching", when: (entry, ctx) => ctx.macos && !entry.dir, run: quickLook },
+  { id: "open", label: "Open", verb: "Fetching", when: (entry, ctx) => ctx.macos && !entry.dir, run: openDefault },
   { id: "vscode", label: "Open in VS Code", when: (entry, ctx) => ctx.vscode && !entry.dir && !entry.source?.on, run: openCode },
-  { id: "download", label: "Download to Downloads", when: (entry) => Boolean(entry.source?.on) && !entry.dir, run: download },
+  { id: "download", label: "Download to Downloads", verb: "Downloading", when: (entry) => Boolean(entry.source?.on) && !entry.dir, run: download },
   { id: "reveal", label: "Reveal in Finder", when: (entry, ctx) => ctx.macos && !entry.source?.on, run: reveal },
   { id: "copy", label: "Copy Path", when: () => true, run: copyPath },
 ];
@@ -28,23 +31,22 @@ export function menuHeight(n) {
   return 8 + 24 + n * 30 + 8;
 }
 
-async function localFile(entry) {
+async function localFile(entry, progress) {
   if (!entry.source?.on) return entry.source.path;
-  notify({ title: "Fetching", body: entry.name || baseName(entry.source.path) });
-  const file = await materialize(entry.source);
+  const file = await materialize(entry.source, progress);
   return file.abs;
 }
 
-async function quickLook(entry) {
-  const abs = await localFile(entry);
+async function quickLook(entry, progress) {
+  const abs = await localFile(entry, progress);
   // qlmanage -p runs until the Quick Look panel closes.
   exec("qlmanage", ["-p", abs]).then((r) => {
     if (r.code !== 0) notify({ title: "Quick Look", body: (r.stderr || "").trim() || "Could not preview the file", level: "error" });
   }, (error) => notify({ title: "Quick Look", body: String(error?.message || error), level: "error" }));
 }
 
-async function openDefault(entry) {
-  const abs = await localFile(entry);
+async function openDefault(entry, progress) {
+  const abs = await localFile(entry, progress);
   const r = await exec("open", [abs]);
   if (r.code !== 0) throw new Error((r.stderr || "").trim() || "Could not open the file");
 }
@@ -57,8 +59,8 @@ async function openCode(entry) {
   if (r.code !== 0) throw new Error((r.stderr || "").trim() || "Could not open the file");
 }
 
-async function download(entry) {
-  const dest = await downloadToDownloads(entry.source);
+async function download(entry, progress) {
+  const dest = await downloadToDownloads(entry.source, progress);
   notify({ title: "Downloaded", body: dest });
 }
 
@@ -72,7 +74,7 @@ async function copyPath(entry) {
   if (r.code !== 0) throw new Error((r.stderr || "").trim() || "Could not copy the path");
 }
 
-export async function openFileMenu(entry) {
+export async function openFileMenu(entry, from) {
   try {
     const macos = window()?.platform === "macos";
     const vscode = macos ? await vscodeInstalled() : false;
@@ -84,7 +86,7 @@ export async function openFileMenu(entry) {
       kind: "popup",
       width: 220,
       height: menuHeight(items.length),
-      props: { role: "menu", entry, ids: items.map((item) => item.id) },
+      props: { role: "menu", entry, from, ids: items.map((item) => item.id) },
     });
   } catch (error) {
     notify({ title: "Files", body: String(error?.message || error), level: "error" });
@@ -107,10 +109,8 @@ export default class Menu {
     const here = props();
     const item = this.list()[index];
     if (!item || !here?.entry) return;
+    setShared(REQUEST, { to: here.from, seq: `${Date.now()}-${Math.random()}`, id: item.id, entry: here.entry });
     closeOverlay(here.overlay);
-    Promise.resolve(item.run(here.entry)).catch((error) => {
-      notify({ title: item.label, body: String(error?.message || error), level: "error" });
-    });
   }
 
   render() {

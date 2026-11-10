@@ -2,12 +2,13 @@
 // The cache is data/files-preview-cache, not this mod folder: a write under
 // mods/files-preview reloads the mod, and image() only draws a path relative
 // to the app home. hc exec cuts one stdout at 8 MiB and that stdout is a
-// UTF-8 string, so each chunk is 8000000 bytes appended by the local shell.
+// UTF-8 string, so chunks well under that are appended by the local shell.
+// At about 1 MB/s, 2 MB chunks keep the progress moving.
 import { createHash } from "crypto";
 import { exists, mkdir, unlink } from "fs/promises";
 import { appHome, exec, home } from "herdr";
 
-const CHUNK = 8000000;
+const CHUNK = 2000000;
 export const PREVIEW_CAP = 50 * 1000 * 1000;
 const MAX_FILES = 200;
 const MAX_BYTES = 500 * 1000 * 1000;
@@ -76,9 +77,10 @@ async function fetchChunks(machine, remotePath, part, size, onProgress) {
     return;
   }
   let got = 0;
+  onProgress?.(0, size);
   const limit = Math.ceil(size / CHUNK) + 1;
   for (let i = 0; got < size && i < limit; i++) {
-    const r = await exec("sh", ["-c", 'hc exec --on "$1" dd if="$2" bs=8000000 skip="$3" count=1 status=none >> "$4"', "sh", machine, remotePath, String(i), part], { timeout: 120000 });
+    const r = await exec("sh", ["-c", 'hc exec --on "$1" dd if="$2" bs="$5" skip="$3" count=1 status=none >> "$4"', "sh", machine, remotePath, String(i), part, String(CHUNK)], { timeout: 120000 });
     if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || "Could not fetch the file");
     const now = await fileSize(part);
     if (now <= got) throw new Error("Could not fetch the file");
