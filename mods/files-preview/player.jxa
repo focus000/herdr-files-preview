@@ -1,0 +1,40 @@
+// AVAudioPlayer for one file, driven through files in dir: cmd.json in
+// ({seq, op: play | pause | seek, t}), state.json out ({t, dur, playing, seq}).
+// It exits when dir/hb is older than 4 s or gone, so a closed or crashed
+// panel never leaves audio playing.
+function run(argv) {
+  ObjC.import("AVFoundation");
+  var file = argv[0], dir = argv[1];
+  var fm = $.NSFileManager.defaultManager;
+  function write(o) {
+    $(JSON.stringify(o)).writeToFileAtomicallyEncodingError(dir + "/state.json", true, $.NSUTF8StringEncoding, null);
+  }
+  function read(path) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+    return s.isNil() ? null : ObjC.unwrap(s);
+  }
+  function age(path) {
+    var a = fm.attributesOfItemAtPathError(path, null);
+    if (a.isNil()) return 1e9;
+    return $.NSDate.date.timeIntervalSinceDate(a.fileModificationDate);
+  }
+  var p = $.AVAudioPlayer.alloc.initWithContentsOfURLError($.NSURL.fileURLWithPath(file), null);
+  if (!p || p.isNil() || !p.prepareToPlay) { write({ error: true }); return; }
+  var seq = null, tick = 0;
+  for (;;) {
+    var c = read(dir + "/cmd.json");
+    if (c) {
+      var o = {};
+      try { o = JSON.parse(c); } catch (e) {}
+      if (o.seq !== seq) {
+        seq = o.seq;
+        if (o.op === "play") p.play;
+        else if (o.op === "pause") p.pause;
+        else if (o.op === "seek") p.setCurrentTime(Math.max(0, Math.min(Number(o.t) || 0, p.duration)));
+      }
+    }
+    if (tick++ % 2 === 0) write({ t: p.currentTime, dur: p.duration, playing: !!p.playing, seq: seq });
+    if (age(dir + "/hb") > 4) { p.stop; return; }
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1));
+  }
+}

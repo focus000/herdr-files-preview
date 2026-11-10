@@ -5,7 +5,9 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, focused, exec, watchFolder, theme, window, props, shared, notify } from "herdr";
 import Menu, { MENU, REQUEST, openFileMenu } from "./menu.js";
-import { formatBytes, loadPage, loadPreview, renderPreview, textEditor } from "./preview.js";
+import { formatBytes, loadPage, loadPreview, picture, renderPreview, textEditor } from "./preview.js";
+import { ImageViewer } from "./viewer.js";
+import { AudioPlayer } from "./audio.js";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -15,6 +17,9 @@ function location() {
 }
 const key = () => JSON.stringify(location());
 const PER_FOLDER = 500, TOTAL = 5000;
+// Each live copy gets its own slot files; numbering restarts with each source
+// version, so reloads reuse the same few paths.
+let slots = 0;
 
 function paneProps() {
   let value = props();
@@ -63,8 +68,23 @@ export default class Files extends View {
     this.uid = `${Date.now()}-${Math.random()}`;
     this.handled = shared(REQUEST)?.seq;
     this.jobs = new Map();
+    const slot = slots++;
+    this.viewer = new ImageViewer(slot);
+    this.player = new AudioPlayer(slot);
     this.refresh(cx);
     cx.timer.every(10000, cx => this.refresh(cx));
+    cx.timer.every(250, cx => {
+      if (!this.player.dir || this.polling) return;
+      this.polling = true;
+      cx.spawn(async cx => {
+        try { if (await this.player.poll()) cx.notify(); }
+        finally { this.polling = false; }
+      });
+    });
+  }
+
+  async close() {
+    await this.player?.stop();
   }
 
   watch(root, cx) {
@@ -164,6 +184,7 @@ export default class Files extends View {
   show(path, cx) {
     this.code?.release(); this.code = null; this.file = path; this.token = (this.token ?? 0) + 1;
     this.pageReq = (this.pageReq ?? 0) + 1;
+    if (this.player.dir) this.player.stop();
     if (!path) {
       this.preview = { state: "idle" };
       this.source = null;
@@ -173,7 +194,8 @@ export default class Files extends View {
     const context = this.context;
     const source = this.sourceFor(path);
     this.source = source;
-    this.preview = { state: "loading" };
+    // The last picture stays up until the next one is ready, as in Preview.
+    this.preview = picture(this.preview) ? this.preview : { state: "loading" };
     if (!cx) return;
     const alive = () => this.token === token && this.file === path && this.current(context);
     cx.spawn(async cx => {
@@ -181,6 +203,24 @@ export default class Files extends View {
         alive,
         update: (next) => {
           if (!alive()) return;
+          if (next.state === "loading" && picture(this.preview) && !(next.total && next.got < next.total)) return;
+          const drawn = picture(next);
+          if (drawn) {
+            cx.spawn(async cx => {
+              try { if (!await this.viewer.load(drawn, cx, alive)) return; this.preview = next; }
+              catch { if (alive()) this.preview = { state: "error", message: "No preview" }; }
+              cx.notify();
+            });
+            return;
+          }
+          if (next.state === "ready" && next.kind === "audio") {
+            cx.spawn(async cx => {
+              try { await this.player.start(next.abs); if (!alive()) return; this.preview = next; }
+              catch { if (alive()) this.preview = { state: "error", message: "Can't play this file" }; }
+              cx.notify();
+            });
+            return;
+          }
           if (next.state === "ready" && next.kind === "text") {
             this.code?.release();
             this.code = textEditor(next.text, source.path);
@@ -205,7 +245,8 @@ export default class Files extends View {
     cx.spawn(async cx => {
       try {
         const next = await loadPage(preview, page);
-        if (this.token !== token || this.pageReq !== req) return;
+        const alive = () => this.token === token && this.pageReq === req;
+        if (!alive() || !await this.viewer.load(picture(next), cx, alive)) return;
         this.preview = next;
       } catch {
         if (this.token === token && this.pageReq === req) this.preview = { state: "error", message: "No preview" };
@@ -278,19 +319,12 @@ export default class Files extends View {
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
       .when(Boolean(this.file), el => el.child(v_flex().id("files-preview").flex_1().min_h(0)
-        .on_size_change((size, cx) => {
-          const width = Math.round(size.width), height = Math.round(size.height);
-          if (width < 2 || height < 2) return;
-          if (this.box?.width === width && this.box?.height === height) return;
-          this.box = { width, height };
-          // The size can be reported during render, where notify() is refused.
-          cx.spawn(async (cx) => { cx.notify(); });
-        })
         .on_mouse_down("right", (_e, cx) => {
           cx.stop_propagation();
           cx.spawn(async () => { await openFileMenu(this.entryFor(this.file, false), this.uid); });
         })
-        .child(renderPreview(this.preview, this.code, this.box, (delta, cx) => this.turn(delta, cx)))))
+        .child(renderPreview(this.preview, { editor: this.code, viewer: this.viewer, player: this.player, name: title, turn: (delta, cx) => this.turn(delta, cx) }))))
+      .when(!this.file, el => el.child(this.viewer.render(false)))
       .when(this.jobs.size > 0, el => el.child(this.jobBar(t)));
   }
 }

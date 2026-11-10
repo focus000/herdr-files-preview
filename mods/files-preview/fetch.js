@@ -200,27 +200,58 @@ export async function pixels(abs) {
   return { width: width || undefined, height: height || undefined };
 }
 
-// Images past this side draw blank, so they are shown from a scaled copy.
-const MAX_SIDE = 2048;
+// image() draws an encoded file up to 16 MiB and a side up to 16384 px; past
+// either it draws nothing. Pixel count is not the limit: 6016 × 6016 draws.
+const MAX_ENCODED = 16 * 1024 * 1024;
+const MAX_SIDE = 16384;
 
-// image() cannot draw an absolute path, and heic/tiff are not drawn as themselves.
-// Returns the drawable path and the original's pixel size.
+async function sips(args) {
+  const r = await exec("sips", args, { timeout: 120000 });
+  if (r.code !== 0) throw new Error((r.stderr || "").trim() || "No preview");
+}
+
+// The original when image() can draw it, else a full-size copy re-encoded to
+// fit: PNG for formats image() can't decode, JPEG when PNG is still too big,
+// and smaller only when JPEG at full size is too big.
+// Returns { abs, ext } to draw and the original's pixel size.
 export async function stageImage(source, file) {
   const ext = extension(source.path);
   const dim = ext === "svg" ? {} : await pixels(file.abs);
-  const convert = ext === "heic" || ext === "heif" || ext === "tif" || ext === "tiff";
-  const shrink = Math.max(dim.width || 0, dim.height || 0) > MAX_SIDE;
-  if (file.rel && VIEWABLE.has(ext) && !shrink) return { rel: file.rel, ...dim };
+  const side = Math.max(dim.width || 0, dim.height || 0);
+  if (VIEWABLE.has(ext) && file.size <= MAX_ENCODED && side <= MAX_SIDE) return { abs: file.abs, ext, ...dim };
   await ensureCache();
   const id = cacheId(source, file.size, file.mtime);
-  const outExt = convert || shrink ? "png" : ext;
-  const name = shrink ? `${id}.img${MAX_SIDE}.png` : `${id}.img.${outExt}`;
-  const rel = `data/files-preview-cache/${name}`;
-  const abs = `${cacheDir()}/${name}`;
-  if (await fileSize(abs) > 0) return { rel, ...dim };
-  const r = convert || shrink
-    ? await exec("sips", [...(shrink ? ["-Z", String(MAX_SIDE)] : []), "-s", "format", "png", file.abs, "--out", abs])
-    : await exec("cp", ["-f", file.abs, abs]);
-  if (r.code !== 0 || await fileSize(abs) <= 0) throw new Error((r.stderr || "").trim() || "No preview");
-  return { rel, ...dim };
+  for (const out of ["png", "jpg"]) {
+    const abs = `${cacheDir()}/${id}.view.${out}`;
+    const have = await fileSize(abs);
+    if (have > 0 && have <= MAX_ENCODED) return { abs, ext: out, ...dim };
+  }
+  const png = `${cacheDir()}/${id}.view.png`;
+  const fits = side <= MAX_SIDE ? [] : ["-Z", String(MAX_SIDE)];
+  if (!VIEWABLE.has(ext) || side > MAX_SIDE) {
+    await sips([...fits, "-s", "format", "png", file.abs, "--out", png]);
+    if (await fileSize(png) <= MAX_ENCODED) return { abs: png, ext: "png", ...dim };
+    await unlink(png).catch(() => {});
+  }
+  const jpg = `${cacheDir()}/${id}.view.jpg`;
+  let limit = Math.min(side || MAX_SIDE, MAX_SIDE);
+  for (let i = 0; i < 8; i++) {
+    await sips(["-Z", String(limit), "-s", "format", "jpeg", "-s", "formatOptions", "92", file.abs, "--out", jpg]);
+    if (await fileSize(jpg) <= MAX_ENCODED) return { abs: jpg, ext: "jpg", ...dim };
+    limit = Math.floor(limit * 0.8);
+  }
+  throw new Error("No preview");
+}
+
+// image() keeps every path it has drawn decoded for the life of the app, so
+// previews reuse a fixed set of slot files. A rewrite under mods/ redraws the
+// slot; under data/ it stays stale.
+export const SLOT_DIR = "mods/files-preview-slots";
+
+export async function placeInSlot(abs, name) {
+  const dir = `${appHome()}/${SLOT_DIR}`;
+  await mkdir(dir, { recursive: true });
+  const r = await exec("sh", ["-c", 'cp -f "$1" "$2.tmp" && mv -f "$2.tmp" "$2"', "slot", abs, `${dir}/${name}`]);
+  if (r.code !== 0) throw new Error((r.stderr || "").trim() || "No preview");
+  return `${SLOT_DIR}/${name}`;
 }

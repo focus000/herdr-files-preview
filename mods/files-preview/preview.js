@@ -1,10 +1,12 @@
 // One preview value: idle, loading, ready, or error. The kind comes from KINDS.
 // A missing extension is text when the bytes have no NUL, otherwise Quick Look.
-import { div, image } from "gpui-kit";
+import { div } from "gpui-kit";
 import { Editor, EditorState, TextView, h_flex, v_flex } from "gpui-base";
-import { appHome, exec, readTextFile, settings, theme, window } from "herdr";
-import { PREVIEW_CAP, cacheDir, cacheId, extension, fileSize, materialize, pixels, stageImage } from "./fetch.js";
+import { exec, readTextFile, settings, theme, window } from "herdr";
+import { PREVIEW_CAP, cacheDir, cacheId, extension, fileSize, materialize, pixels, stageImage, statSource } from "./fetch.js";
 
+// Past this the read-only editor takes seconds to build (1 MB: about 2 s), so
+// bigger text goes to Quick Look rather than being cut off.
 const TEXT_CAP = 1024 * 1024;
 
 // PDFPage.thumbnailOfSize is not a function in JavaScript for Automation on
@@ -60,8 +62,8 @@ export const KINDS = {
   ppt: "quicklook", pptx: "quicklook", pptm: "quicklook", odp: "quicklook",
   mp4: "quicklook", mov: "quicklook", m4v: "quicklook", avi: "quicklook", mkv: "quicklook",
   webm: "quicklook", mpg: "quicklook", mpeg: "quicklook",
-  mp3: "quicklook", m4a: "quicklook", wav: "quicklook", aac: "quicklook", flac: "quicklook",
-  aiff: "quicklook", aif: "quicklook",
+  mp3: "audio", m4a: "audio", wav: "audio", aac: "audio", flac: "audio",
+  aiff: "audio", aif: "audio", caf: "audio",
   zip: "quicklook", gz: "quicklook", tgz: "quicklook", tar: "quicklook", bz2: "quicklook",
   xz: "quicklook", rar: "quicklook", "7z": "quicklook", dmg: "quicklook", iso: "quicklook",
   psd: "quicklook", ai: "quicklook", sketch: "quicklook", eps: "quicklook",
@@ -83,17 +85,13 @@ export function formatBytes(n) {
   return `${(n / 1e9).toFixed(1)} GB`;
 }
 
-function clip(text) {
-  return text.length >= TEXT_CAP ? `${text.slice(0, TEXT_CAP)}\n… (file truncated)` : text;
-}
-
 async function readText(source) {
   let text;
   try { text = await readTextFile(source.path, { on: source.on }); }
   catch { return undefined; }
   if (text == null) return null;
   if (text.includes("\0")) return undefined;
-  return clip(text);
+  return text;
 }
 
 export function textEditor(text, path) {
@@ -116,21 +114,21 @@ export async function renderPdf(abs, page, id, knownPages) {
   const rel = `data/files-preview-cache/${name}`;
   const out = `${cacheDir()}/${name}`;
   if (knownPages && await fileSize(out) > 0) {
-    return { rel, page: next, pages: knownPages, cacheKey: id, ...(await pixels(out)) };
+    return { rel, file: out, page: next, pages: knownPages, cacheKey: id, ...(await pixels(out)) };
   }
   const r = await exec("osascript", ["-l", "JavaScript", "-e", PDF_SCRIPT, abs, out, String(next), "1600"], { timeout: 60000 });
   if (r.code !== 0) throw new Error("No preview");
   let meta;
   try { meta = JSON.parse(r.stdout.trim()); }
   catch { throw new Error("No preview"); }
-  return { rel, page: meta.page, pages: meta.pages, width: meta.width, height: meta.height, cacheKey: id };
+  return { rel, file: out, page: meta.page, pages: meta.pages, width: meta.width, height: meta.height, cacheKey: id };
 }
 
 async function quicklook(abs, id) {
   const name = `${id}.ql.png`;
   const rel = `data/files-preview-cache/${name}`;
   const out = `${cacheDir()}/${name}`;
-  if (await fileSize(out) > 0) return { rel, ...(await pixels(out)) };
+  if (await fileSize(out) > 0) return { rel, file: out, ...(await pixels(out)) };
   const dir = `${cacheDir()}/${id}.qldir`;
   await exec("rm", ["-rf", dir]);
   await mkdirQuiet(dir);
@@ -140,7 +138,7 @@ async function quicklook(abs, id) {
   const mv = await exec("mv", ["-f", produced, out]);
   await exec("rm", ["-rf", dir]);
   if (r.code !== 0 || mv.code !== 0 || await fileSize(out) <= 0) throw new Error("No preview");
-  return { rel, ...(await pixels(out)) };
+  return { rel, file: out, ...(await pixels(out)) };
 }
 
 async function mkdirQuiet(dir) {
@@ -156,8 +154,18 @@ function fail(error) {
 
 export async function loadPreview(source, hooks) {
   const { alive, update } = hooks;
-  const known = KINDS[extension(source.path)] ?? null;
+  let known = KINDS[extension(source.path)] ?? null;
+  let note = null;
   try {
+    if (known === "text" || known === "markdown" || known == null) {
+      const st = await statSource(source);
+      if (!alive()) return;
+      if (!st) return update({ state: "error", message: "This file is no longer available" });
+      if (st.size > TEXT_CAP) {
+        if (known != null) note = "Over 1 MB · right-click for Quick Look";
+        known = "quicklook";
+      }
+    }
     if (known === "text" || known === "markdown") {
       // show() already set loading. Notifying here still runs inside render when
       // a folder change calls show() from render, and Herdr refuses that.
@@ -177,7 +185,7 @@ export async function loadPreview(source, hooks) {
       }
     }
     const kind = known ?? "quicklook";
-    if ((kind === "pdf" || kind === "quicklook") && !isMac()) {
+    if ((kind === "pdf" || kind === "quicklook" || kind === "audio") && !isMac()) {
       update({ state: "error", message: "No preview" });
       return;
     }
@@ -189,7 +197,11 @@ export async function loadPreview(source, hooks) {
     if (kind === "image") {
       const staged = await stageImage(source, file);
       if (!alive()) return;
-      update({ state: "ready", kind, size: file.size, abs: file.abs, ...staged });
+      update({ state: "ready", kind, size: file.size, abs: file.abs, width: staged.width, height: staged.height, staged });
+      return;
+    }
+    if (kind === "audio") {
+      update({ state: "ready", kind, size: file.size, abs: file.abs });
       return;
     }
     const id = cacheId(source, file.size, file.mtime);
@@ -201,23 +213,23 @@ export async function loadPreview(source, hooks) {
     }
     const thumb = await quicklook(file.abs, id);
     if (!alive()) return;
-    update({ state: "ready", kind: "quicklook", size: file.size, abs: file.abs, ...thumb });
+    update({ state: "ready", kind: "quicklook", size: file.size, abs: file.abs, note, ...thumb });
   } catch (error) {
     if (alive()) update(fail(error));
   }
 }
 
+// What the viewer draws for a ready preview, or null for kinds it doesn't.
+export function picture(preview) {
+  if (preview?.state !== "ready") return null;
+  if (preview.kind === "image") return { ...preview.staged, zoomable: true };
+  if (preview.kind === "pdf" || preview.kind === "quicklook") return { abs: preview.file, ext: "png", width: preview.width, height: preview.height, zoomable: false };
+  return null;
+}
+
 export async function loadPage(preview, page) {
   const rendered = await renderPdf(preview.abs, page, preview.cacheKey, preview.pages);
   return { ...preview, state: "ready", ...rendered };
-}
-
-function contain(width, height, box) {
-  const bw = Math.max(1, Math.floor((box?.width ?? 280) - 24));
-  const bh = Math.max(1, Math.floor((box?.height ?? 280) - 56));
-  if (!width || !height) return { w: Math.min(bw, 320), h: Math.min(bh, 240) };
-  const scale = Math.min(bw / width, bh / height, 1);
-  return { w: Math.max(1, Math.round(width * scale)), h: Math.max(1, Math.round(height * scale)) };
 }
 
 function step(id, label, enabled, onClick) {
@@ -229,31 +241,48 @@ function step(id, label, enabled, onClick) {
     .child(label);
 }
 
-export function renderPreview(preview, editor, box, turn) {
+function zoomLabel(viewer) {
+  const s = viewer.scale();
+  return s == null ? "" : `${Math.round(s * 100)}%`;
+}
+
+// Images, PDF pages and Quick Look thumbnails all draw through the viewer's
+// slots; the viewer is drawn (hidden) under every other kind too.
+export function renderPreview(preview, { editor, viewer, player, turn, name }) {
   const t = theme();
-  if (!preview || preview.state === "idle") return div().p(12).text_color(t.dim).child("");
-  if (preview.state === "loading") {
-    const label = preview.total != null ? `Fetching ${mb(preview.got || 0)} / ${mb(preview.total)} MB` : "Loading…";
-    return div().p(12).text_color(t.dim).child(label);
-  }
-  if (preview.state === "error") return div().p(12).text_color(t.dim).child(preview.message);
-  if (preview.kind === "markdown") {
-    return v_flex().flex_1().min_h(0).overflow_y_scrollbar().p(12)
-      .child(TextView.markdown("files-preview-md", preview.text || ""));
-  }
-  if (preview.kind === "text") {
-    return editor ? Editor.new(editor).flex_1().min_h(0) : div().p(12).text_color(t.dim).child("Loading…");
-  }
-  const fit = contain(preview.width, preview.height, box);
-  const bits = [formatBytes(preview.size), preview.width && preview.height ? `${preview.width} × ${preview.height}` : ""].filter(Boolean);
-  return v_flex().flex_1().min_h(0)
-    .child(v_flex().flex_1().min_h(0).items_center().justify_center().overflow_hidden()
-      .child(preview.rel ? image(preview.rel).flex_none().w(fit.w).h(fit.h).rounded(4) : div()))
-    .child(h_flex().h(32).flex_none().px(10).gap(8).items_center().border_t(1).border_color(t.border)
-      .when(preview.kind === "pdf", (el) => el
-        .child(step("pdf-prev", "‹", preview.page > 1, (cx) => turn(-1, cx)))
-        .child(div().text_size(12).text_color(t.muted).child(`${preview.page} / ${preview.pages}`))
-        .child(step("pdf-next", "›", preview.page < preview.pages, (cx) => turn(1, cx))))
-      .child(div().flex_1())
-      .child(div().text_size(11).text_color(t.dim).child(bits.join("   "))));
+  const pictured = preview?.state === "ready" && (preview.kind === "image" || preview.kind === "pdf" || preview.kind === "quicklook");
+  const body = (() => {
+    if (!preview || preview.state === "idle") return div();
+    if (preview.state === "loading") {
+      const label = preview.total != null ? `Fetching ${mb(preview.got || 0)} / ${mb(preview.total)} MB` : "Loading…";
+      return div().p(12).text_color(t.dim).child(label);
+    }
+    if (preview.state === "error") return div().p(12).text_color(t.dim).child(preview.message);
+    if (preview.kind === "markdown") {
+      return v_flex().flex_1().min_h(0).overflow_y_scrollbar().p(12)
+        .child(TextView.markdown("files-preview-md", preview.text || "").selectable(true));
+    }
+    if (preview.kind === "text") {
+      return editor ? Editor.new(editor).flex_1().min_h(0) : div().p(12).text_color(t.dim).child("Loading…");
+    }
+    if (preview.kind === "audio") return player.render(name);
+    const bits = [formatBytes(preview.size), preview.width && preview.height ? `${preview.width} × ${preview.height}` : ""].filter(Boolean);
+    return v_flex().flex_1().min_h(0)
+      .child(viewer.render(true))
+      .child(h_flex().h(32).flex_none().px(10).gap(8).items_center().border_t(1).border_color(t.border)
+        .when(preview.kind === "pdf", (el) => el
+          .child(step("pdf-prev", "‹", preview.page > 1, (cx) => turn(-1, cx)))
+          .child(div().text_size(12).text_color(t.muted).child(`${preview.page} / ${preview.pages}`))
+          .child(step("pdf-next", "›", preview.page < preview.pages, (cx) => turn(1, cx))))
+        .when(preview.kind === "image", (el) => el
+          .child(div().id("image-zoom").px(6).h(22).flex().items_center().rounded(4).text_size(12).text_color(t.muted)
+            .cursor_pointer().hover((s) => s.bg(t.hover))
+            .on_click((_e, cx) => viewer.zoomTo(Math.abs(viewer.scale() - viewer.fit(viewer.shown())) < 1e-3 ? 1 : viewer.fit(viewer.shown()), null, cx))
+            .child(zoomLabel(viewer))))
+        .when(Boolean(preview.note), (el) => el.child(div().min_w(0).truncate().text_size(11).text_color(t.muted).child(preview.note)))
+        .child(div().flex_1())
+        .child(div().flex_none().text_size(11).text_color(t.dim).child(bits.join("   "))));
+  })();
+  if (pictured) return body;
+  return v_flex().flex_1().min_h(0).relative().child(viewer.render(false)).child(body);
 }
